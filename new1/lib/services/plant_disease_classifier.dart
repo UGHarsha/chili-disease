@@ -19,9 +19,7 @@ class PlantDiseaseClassifier {
 
   Interpreter? _interpreter;
   late List<String> _labels;
-  late TensorType _inputType;
   late List<int> _inputShape;
-  late TensorType _outputType;
   late List<int> _outputShape;
   bool _isLoaded = false;
 
@@ -31,98 +29,98 @@ class PlantDiseaseClassifier {
     _labels = await _loadLabels();
 
     try {
-      final options = InterpreterOptions()..threads = 2;
-      _interpreter = await Interpreter.fromAsset(modelAssetPath, options: options);
+      final options = InterpreterOptions()..threads = 4;
+      _interpreter =
+          await Interpreter.fromAsset(modelAssetPath, options: options);
     } on Exception catch (e) {
       throw PlantModelLoadException(
         'Unable to load the TensorFlow Lite model from "$modelAssetPath". '
-        'Place a valid .tflite file under assets/model/, add it to pubspec.yaml, '
-        'and ensure the path matches. Original error: $e',
+        'Original error: $e',
       );
     }
 
     final inputTensor = _interpreter!.getInputTensor(0);
-    _inputType = inputTensor.type;
-    _inputShape = inputTensor.shape;
-  if (_inputType != TensorType.float32) {
-      throw PlantModelLoadException(
-        'Unsupported input tensor type "$_inputType". Only float32 models are supported by the current pipeline.',
-      );
-    }
+    _inputShape = inputTensor.shape; // e.g. [1, 224, 224, 3]
 
     final outputTensor = _interpreter!.getOutputTensor(0);
-    _outputType = outputTensor.type;
-    _outputShape = outputTensor.shape;
-  if (_outputType != TensorType.float32) {
-      throw PlantModelLoadException(
-        'Unsupported output tensor type "$_outputType". Only float32 outputs are supported by the current pipeline.',
-      );
-    }
+    _outputShape = outputTensor.shape; // e.g. [1, 6]
+
     if (outputTensor.shape.last != _labels.length) {
       throw PlantModelLoadException(
-        'Model output dimension (${outputTensor.shape.last}) does not match label count (${_labels.length}). '
-        'Regenerate labels.txt or confirm the training pipeline configuration.',
+        'Model output dimension (${outputTensor.shape.last}) does not match '
+        'label count (${_labels.length}). Fix labels.txt.',
       );
     }
     _isLoaded = true;
   }
 
+  /// Run inference and return a prediction with top-3 alternatives.
   Future<DiseasePrediction> predict(File imageFile) async {
     if (!_isLoaded) {
-      throw StateError('The model is not loaded. Call load() before predict().');
+      throw StateError('Call load() before predict().');
     }
     if (!await imageFile.exists()) {
-      throw ArgumentError('Image file not found at path: ${imageFile.path}');
+      throw ArgumentError('Image file not found: ${imageFile.path}');
     }
 
     final rawBytes = await imageFile.readAsBytes();
-    final decodedImage = img.decodeImage(rawBytes);
-    if (decodedImage == null) {
+    final decoded = img.decodeImage(rawBytes);
+    if (decoded == null) {
       throw PlantModelLoadException('Failed to decode the selected image.');
     }
 
-    final input = _buildInputTensor(decodedImage);
-    final output = _createEmptyOutputBuffer();
+    final input = _buildInputTensor(decoded);
+    final output = _createOutputBuffer();
 
     _interpreter!.run(input, output);
 
-    final scores = _extractScores(output);
-    final labeledProbabilities = <String, double>{};
+    final scores = output[0]; // already probabilities from the model
+
+    // Pair each label with its score.
+    final entries = <MapEntry<String, double>>[];
     for (var i = 0; i < _labels.length && i < scores.length; i++) {
-      labeledProbabilities[_labels[i]] = scores[i];
+      entries.add(MapEntry(_labels[i], scores[i]));
+    }
+    if (entries.isEmpty) {
+      throw PlantModelLoadException('Model produced no scores.');
     }
 
-    if (labeledProbabilities.isEmpty) {
-      throw PlantModelLoadException('Model produced no scores for the provided image.');
-    }
+    // Sort descending by confidence.
+    entries.sort((a, b) => b.value.compareTo(a.value));
+    final k = min(3, entries.length);
 
-    final topEntry = labeledProbabilities.entries.reduce(
-      (currentMax, candidate) => candidate.value > currentMax.value ? candidate : currentMax,
-    );
+    final topPredictions = <DiseasePrediction>[];
+    for (var i = 0; i < k; i++) {
+      final label = entries[i].key;
+      topPredictions.add(DiseasePrediction(
+        label: label,
+        confidence: entries[i].value,
+        info: kDiseaseDetails[label],
+      ));
+    }
 
     return DiseasePrediction(
-      label: topEntry.key,
-      confidence: topEntry.value,
-      info: kDiseaseDetails[topEntry.key],
+      label: topPredictions.first.label,
+      confidence: topPredictions.first.confidence,
+      info: topPredictions.first.info,
+      alternatives:
+          topPredictions.length > 1 ? topPredictions.sublist(1) : null,
     );
   }
+
+  // ─── Labels ──────────────────────────────────────────────────────────
 
   Future<List<String>> _loadLabels() async {
     final raw = await rootBundle.loadString(labelsAssetPath);
     final lines = raw.split('\n');
     final labels = <String>[];
+    // Teachable Machine format: "0 ClassName"
     final pattern = RegExp(r'^(\d+)\s+(.+)$');
     for (final line in lines) {
       final trimmed = line.trim();
-      if (trimmed.isEmpty) {
-        continue;
-      }
+      if (trimmed.isEmpty) continue;
       final match = pattern.firstMatch(trimmed);
-      if (match != null) {
-        labels.add(match.group(2)!);
-      } else {
-        labels.add(trimmed);
-      }
+      labels.add(match != null ? match.group(2)! : trimmed);
     }
     if (labels.isEmpty) {
       throw PlantModelLoadException('No labels found in $labelsAssetPath');
@@ -136,61 +134,76 @@ class PlantDiseaseClassifier {
     _isLoaded = false;
   }
 
+  // ─── Image → Tensor ─────────────────────────────────────────────────
+  //
+  // Teachable Machine (model_unquant.tflite) preprocessing:
+  //   1. Bake EXIF orientation so phone-camera rotation is handled.
+  //   2. Center-crop to a square (matching TM's cropTo() function).
+  //   3. Resize to model input size (224×224).
+  //   4. Normalise to [-1, 1] using the official TM formula:
+  //        (pixel / 127.5) - 1.0
+  //      Source: https://github.com/googlecreativelab/teachablemachine-community
+  //        libraries/image/src/utils/tf.ts  →  capture()
+  //        snippets/converter/image/test/test-image-tflite.py
+  //        snippets/markdown/image/tensorflow/keras.md
+
   List<List<List<List<double>>>> _buildInputTensor(img.Image image) {
-    final height = _inputShape[1];
-    final width = _inputShape[2];
-    final channels = _inputShape.length > 3 ? _inputShape[3] : 1;
+    final targetH = _inputShape[1]; // typically 224
+    final targetW = _inputShape[2]; // typically 224
 
-    if (channels != 3) {
-      throw PlantModelLoadException(
-        'Expected RGB input with 3 channels. The model reports $channels channels.',
-      );
-    }
+    // ── Step 1: Bake EXIF orientation ──
+    // Phone cameras write rotation as EXIF metadata rather than rotating
+    // pixels. bakeOrientation applies the rotation so the model sees
+    // the image the way the user sees it.
+    final oriented = img.bakeOrientation(image);
 
-    final resized = img.copyResize(image, width: width, height: height);
-    final imageTensor = List<List<List<double>>>.generate(height, (y) {
-      return List<List<double>>.generate(width, (x) {
+    // ── Step 2: Center-crop to square ──
+    final srcW = oriented.width;
+    final srcH = oriented.height;
+    final cropSize = min(srcW, srcH);
+    final offsetX = (srcW - cropSize) ~/ 2;
+    final offsetY = (srcH - cropSize) ~/ 2;
+    final cropped = img.copyCrop(
+      oriented,
+      offsetX,
+      offsetY,
+      cropSize,
+      cropSize,
+    );
+
+    // ── Step 3: Resize to model input size ──
+    final resized = img.copyResize(
+      cropped,
+      width: targetW,
+      height: targetH,
+      interpolation: img.Interpolation.linear,
+    );
+
+    // ── Step 4: Build float32 tensor with [-1, 1] normalisation ──
+    // Official Teachable Machine formula: (pixel / 127.5) - 1.0
+    final tensor = List<List<List<double>>>.generate(targetH, (y) {
+      return List<List<double>>.generate(targetW, (x) {
         final pixel = resized.getPixel(x, y);
-        final r = img.getRed(pixel).toDouble();
-        final g = img.getGreen(pixel).toDouble();
-        final b = img.getBlue(pixel).toDouble();
-        return [
-          (r - 127.5) / 127.5,
-          (g - 127.5) / 127.5,
-          (b - 127.5) / 127.5,
-        ];
+        final r = (img.getRed(pixel).toDouble() / 127.5) - 1.0;
+        final g = (img.getGreen(pixel).toDouble() / 127.5) - 1.0;
+        final b = (img.getBlue(pixel).toDouble() / 127.5) - 1.0;
+        return [r, g, b];
       });
     });
 
-    return [imageTensor];
+    return [tensor]; // shape: [1, targetH, targetW, 3]
   }
 
-  List<List<double>> _createEmptyOutputBuffer() {
+  // ─── Output buffer ──────────────────────────────────────────────────
+
+  List<List<double>> _createOutputBuffer() {
     final classCount = _outputShape.last;
-    return [List<double>.filled(classCount, 0)];
+    return [List<double>.filled(classCount, 0.0)];
   }
 
-  List<double> _extractScores(List<List<double>> outputBuffer) {
-    final rawScores = outputBuffer.first;
-    if (rawScores.isEmpty) {
-      return const [];
-    }
-
-    // Apply softmax for stability in case the model outputs logits.
-    final maxLogit = rawScores.reduce(max);
-    double sum = 0;
-    final expScores = List<double>.filled(rawScores.length, 0);
-    for (var i = 0; i < rawScores.length; i++) {
-      final value = rawScores[i];
-      final expValue = exp(value - maxLogit);
-      expScores[i] = expValue;
-      sum += expValue;
-    }
-    if (sum == 0) {
-      return rawScores;
-    }
-    return expScores.map((value) => value / sum).toList(growable: false);
-  }
+  // NOTE: We do NOT apply softmax here. Teachable Machine unquant models
+  // already output softmax probabilities. Applying softmax a second time
+  // would distort the distribution and flip prediction rankings.
 }
 
 class PlantModelLoadException implements Exception {
