@@ -1,0 +1,6 @@
+0 Anthracnose
+1 bacterial_spot
+2 Cercospora leaf spot Cercospora capsicib (frog eye leaf spot)
+3 Chilli Leaf Curl Disease
+4 Naarati Gana Weema
+5 Powdery mildew - Leveillula taurica
